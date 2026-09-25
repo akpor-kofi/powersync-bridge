@@ -5,6 +5,27 @@
   "license": "MIT",
   "type": "module",
   "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/akpor-kofi/powersync-bridge.git",
+    "directory": "packages/react"
+  },
+  "homepage": "https://github.com/akpor-kofi/powersync-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/akpor-kofi/powersync-bridge/issues"
+  },
+  "keywords": [
+    "powersync",
+    "offline-first",
+    "local-first",
+    "sqlite",
+    "sync",
+    "react",
+    "hooks"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -15,7 +36,9 @@
       "require": "./dist/index.cjs"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsup",
     "typecheck": "tsc --noEmit"
