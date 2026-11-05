@@ -1,4 +1,6 @@
 export * from './types';
+export { InfiniteQueryStore, OfflineError, infiniteQueryKey } from './query';
+export type { InfiniteQueryOptions, InfiniteQueryResult, QueryPage } from './query';
 export { createBridge, Bridge } from './bridge';
 export type { BridgeOptions, ConnectorLike, Platform, PlatformGates, RacePolicy } from './bridge';
 export { defineRacedList, defineInfiniteList } from './define';

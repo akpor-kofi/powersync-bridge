@@ -83,6 +83,7 @@ export class InfiniteListStore<TItem, TScope, K extends OrderKey<TItem>, TCursor
   private reason: BoundaryReason | undefined;
   private awaitingSync = false;
   private loading = false;
+  private localPagePending = false;
   private errors: ListErrors = {};
   private warnings: string[] = [];
   private errorCount = 0;
@@ -102,16 +103,16 @@ export class InfiniteListStore<TItem, TScope, K extends OrderKey<TItem>, TCursor
 
   retain(): void {
     this.refs += 1;
-    if (this.refs === 1) this.subscribeLocal();
+    if (this.refs === 1 && this.unsubDiffs === null) this.subscribeLocal();
   }
 
   release(): void {
     this.refs -= 1;
-    if (this.refs <= 0) this.dispose();
+    if (this.refs <= 0) queueMicrotask(() => { if (this.refs <= 0) this.dispose(); });
   }
 
   get isDisposed(): boolean {
-    return this.disposed;
+    return this.disposed || (this.refs <= 0 && this.unsubDiffs !== null);
   }
 
   swapRoot(): void {
@@ -127,6 +128,11 @@ export class InfiniteListStore<TItem, TScope, K extends OrderKey<TItem>, TCursor
     for (const h of this.subs.values()) h.unsubscribe();
     this.subs.clear();
     this.lru.length = 0;
+    this.local.clear();
+    this.apiRows.clear();
+    this.retained.clear();
+    this.tombstones.clear();
+    this.store.replace(emptyInfiniteResult<TItem>());
   }
 
   // ---------------------------------------------------------------------------
@@ -140,6 +146,7 @@ export class InfiniteListStore<TItem, TScope, K extends OrderKey<TItem>, TCursor
       (diff) => void this.onDiff(diff),
       (err) => {
         this.localError = err;
+        if (this.localPagePending) { this.localPagePending = false; this.loading = false; }
         this.render();
       },
     );
@@ -160,6 +167,8 @@ export class InfiniteListStore<TItem, TScope, K extends OrderKey<TItem>, TCursor
       this.apiRows.delete(id); // local claims the id
     }
     this.local = next;
+    this.localError = undefined;
+    if (this.localPagePending) { this.localPagePending = false; this.loading = false; }
     this.emissionSeen = true;
 
     const removed = new Map<string, TItem>();
@@ -221,6 +230,8 @@ export class InfiniteListStore<TItem, TScope, K extends OrderKey<TItem>, TCursor
   async loadMore(): Promise<void> {
     if (this.disposed || this.loading || this.boundary === 'end') return;
     if (this.lookahead) {
+      this.localPagePending = true;
+      this.loading = true;
       this.pages += 1;
       this.boundary = 'more';
       this.reason = undefined;
@@ -402,6 +413,8 @@ export class InfiniteListStore<TItem, TScope, K extends OrderKey<TItem>, TCursor
   }
 
   private absorbApi(rows: readonly TItem[]): void {
+    const { api: _previousApiError, ...remainingErrors } = this.errors;
+    this.errors = remainingErrors;
     this.errorCount = 0;
     this.nextRetryAt = 0;
     let added = 0;
@@ -410,6 +423,13 @@ export class InfiniteListStore<TItem, TScope, K extends OrderKey<TItem>, TCursor
       if (this.local.has(id) || this.apiRows.has(id) || this.tombstones.has(id)) continue; // id-set dedupe (R13)
       this.apiRows.set(id, row);
       added += 1;
+    }
+    // API rows extend the loaded range too. Keep the local watch at least this wide, so a
+    // later insert cannot push a previously loaded boundary row out of a one-page watch.
+    const loadedPages = Math.max(this.pages, Math.ceil(this.mergedEntries().length / this.def.pageSize));
+    if (loadedPages > this.pages) {
+      this.pages = loadedPages;
+      this.subscribeLocal();
     }
     if (rows.length === 0) {
       this.boundary = 'end';

@@ -1,6 +1,6 @@
 {
   "name": "@powersync-bridge/powersync",
-  "version": "0.0.1-alpha.0",
+  "version": "0.0.1-alpha.1",
   "description": "PowerSync driver for powersync-bridge: differentialWatch, upload-queue mirror, presence probes, sync streams and status, on top of @powersync/common.",
   "license": "MIT",
   "type": "module",
@@ -42,7 +42,7 @@
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
-    "@powersync/common": ">=2.3.0",
+    "@powersync/common": "^1.57.3 || ^2.3.0",
     "powersync-bridge": "workspace:*"
   },
   "devDependencies": {

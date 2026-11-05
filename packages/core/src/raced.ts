@@ -104,16 +104,16 @@ export class RacedListStore<TItem, TScope, TApi, K extends OrderKey<TItem>> {
 
   retain(): void {
     this.refs += 1;
-    if (this.refs === 1) this.start();
+    if (this.refs === 1 && this.unsubDiffs === null) this.start();
   }
 
   release(): void {
     this.refs -= 1;
-    if (this.refs <= 0) this.dispose();
+    if (this.refs <= 0) queueMicrotask(() => { if (this.refs <= 0) this.dispose(); });
   }
 
   get isDisposed(): boolean {
-    return this.disposed;
+    return this.disposed || (this.refs <= 0 && this.unsubDiffs !== null);
   }
 
   /** Synchronous part of an identity swap: the snapshot becomes empty 'pending' at once (R15). */
@@ -130,6 +130,14 @@ export class RacedListStore<TItem, TScope, TApi, K extends OrderKey<TItem>> {
     this.unsubFresh?.();
     if (this.snapWindow) this.deps.crud.closeWindow(this.snapWindow);
     this.snapWindow = null;
+    this.local?.clear();
+    this.local = null;
+    this.snap = null;
+    this.prepared = null;
+    this.overlay.clear();
+    this.inSession.clear();
+    this.tombstones.clear();
+    this.store.replace(emptyRacedResult<TItem>());
   }
 
   // ---------------------------------------------------------------------------

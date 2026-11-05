@@ -1,6 +1,6 @@
 {
   "name": "@powersync-bridge/drizzle",
-  "version": "0.0.1-alpha.0",
+  "version": "0.0.1-alpha.1",
   "description": "Drizzle adapter for powersync-bridge: executes builders through the ORM so rows arrive decoded, derives watched tables, and hands the SDK a compilable query.",
   "license": "MIT",
   "type": "module",
@@ -44,7 +44,7 @@
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
-    "@powersync/drizzle-driver": ">=0.8.0",
+    "@powersync/drizzle-driver": "^0.7.4 || ^0.8.0",
     "drizzle-orm": ">=0.36.0",
     "powersync-bridge": "workspace:*"
   },

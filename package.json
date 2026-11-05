@@ -9,7 +9,8 @@
     "test:watch": "vitest",
     "typecheck": "pnpm -r --filter './packages/**' typecheck",
     "clean": "pnpm -r --filter './packages/**' exec rm -rf dist",
-    "release": "pnpm build && pnpm test && pnpm -r publish --access public --tag alpha --no-git-checks"
+    "release": "pnpm build && pnpm typecheck && pnpm test && pnpm release:publish",
+    "release:publish": "node scripts/publish.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",

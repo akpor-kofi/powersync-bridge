@@ -83,7 +83,7 @@ export class CrudMirror {
     for (const r of refs) next.set(refKey(r.table, r.id), r);
     const added: PendingOpRef[] = [];
     const completed: PendingOpRef[] = [];
-    for (const [k, r] of next) if (!this.live.has(k)) added.push(r);
+    for (const [k, r] of next) if (this.live.get(k)?.op !== r.op) added.push(r);
     for (const [k, r] of this.live) if (!next.has(k)) completed.push(r);
     if (added.length || completed.length) this.apply({ added, completed });
   }

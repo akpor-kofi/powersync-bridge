@@ -47,6 +47,15 @@ export class SnapshotCache {
     if (existing && (existing.result === null || now - existing.result.fetchedAt < staleTime)) {
       return existing.promise;
     }
+    // Bound completed snapshots across searches/windows. In-flight requests keep their abort path.
+    for (const [entryKey, entry] of this.entries) {
+      if (entry.result && now - entry.result.fetchedAt >= staleTime) this.entries.delete(entryKey);
+    }
+    if (this.entries.size >= 64) {
+      for (const [entryKey, entry] of this.entries) {
+        if (entry.result) { this.entries.delete(entryKey); break; }
+      }
+    }
     const controller = new AbortController();
     const run = async (signal: AbortSignal): Promise<SnapshotRecord<TApi>> => {
       const res = await fetcher(signal);
@@ -66,6 +75,13 @@ export class SnapshotCache {
       },
     );
     return promise;
+  }
+
+  /** Cancel every in-flight fetch under a key prefix (identity swap). */
+  invalidate(key: readonly unknown[]): void {
+    const encoded = JSON.stringify(key);
+    this.entries.get(encoded)?.controller.abort(new Error('invalidated'));
+    this.entries.delete(encoded);
   }
 
   /** Cancel every in-flight fetch under a key prefix (identity swap). */

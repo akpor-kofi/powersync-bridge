@@ -141,7 +141,7 @@ export interface SyncStatusView {
 export interface BridgeDriver {
   query<T>(q: PreparedQuery<T>, signal?: AbortSignal): Promise<T[]>;
   diffs<T>(q: PreparedQuery<T>, opts?: { throttleMs?: number }): DifferentialStream<T>;
-  /** Full read of the upload queue (iterate `getCrudBatch` until `haveMore` is false), keyed (table, id). */
+  /** Full read of the upload queue without acknowledgement, keyed (table, id), last operation wins. */
   pendingUploadIds(): Promise<PendingOpRef[]>;
   /** The driver diffs consecutive queue snapshots and EMITS the delta; core never re-diffs. */
   onCrudChange(cb: (delta: CrudDelta) => void): () => void;

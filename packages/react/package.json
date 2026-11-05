@@ -1,6 +1,6 @@
 {
   "name": "@powersync-bridge/react",
-  "version": "0.0.1-alpha.0",
+  "version": "0.0.1-alpha.1",
   "description": "React bindings for powersync-bridge: BridgeProvider, useRacedList, useInfiniteList, useOnDemandStream, useAutoSync (useSyncExternalStore-based).",
   "license": "MIT",
   "type": "module",

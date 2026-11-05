@@ -161,19 +161,16 @@ export class PowerSyncDriver implements BridgeDriver {
   // -- upload queue mirror ----------------------------------------------------
 
   async pendingUploadIds(): Promise<PendingOpRef[]> {
-    const refs: PendingOpRef[] = [];
-    let batch = await this.db.getCrudBatch(100);
-    while (batch) {
-      for (const e of batch.crud) refs.push({ table: e.table, id: String(e.id), op: mapOp(e.op) });
-      if (!batch.haveMore) break;
-      batch = await this.db.getCrudBatch(100 * 2 ** Math.min(6, refs.length / 100));
-      // NOTE: getCrudBatch always starts from the head of the queue; growing the limit pages the
-      // whole queue in without calling complete(). Cap at 6,400 per call to bound the read.
-      if (refs.length >= 6400) break;
-    }
-    // de-duplicate by (table,id), keeping the LAST op for an id
+    // The public transaction iterator advances without acknowledging anything. getCrudBatch()
+    // always reads the head, so repeated capped batches cannot observe a long offline queue.
+    // Keep only identity/operation facts, rather than retaining every transaction payload.
     const byKey = new Map<string, PendingOpRef>();
-    for (const r of refs) byKey.set(refKey(r), r);
+    for await (const transaction of this.db.getCrudTransactions()) {
+      for (const entry of transaction.crud) {
+        const ref = { table: entry.table, id: String(entry.id), op: mapOp(entry.op) };
+        byKey.set(refKey(ref), ref);
+      }
+    }
     return Array.from(byKey.values());
   }
 
@@ -213,7 +210,7 @@ export class PowerSyncDriver implements BridgeDriver {
         for (const r of refs) next.set(refKey(r), r);
         const added: PendingOpRef[] = [];
         const completed: PendingOpRef[] = [];
-        for (const [k, r] of next) if (!this.crudMirror.has(k)) added.push(r);
+        for (const [k, r] of next) if (this.crudMirror.get(k)?.op !== r.op) added.push(r);
         for (const [k, r] of this.crudMirror) if (!next.has(k)) completed.push(r);
         this.crudMirror.clear();
         for (const [k, r] of next) this.crudMirror.set(k, r);
@@ -264,8 +261,8 @@ export class PowerSyncDriver implements BridgeDriver {
     const s = this.db.currentStatus;
     const streams = (s.syncStreams ?? []).map(toStreamStatus);
     return {
-      connected: s.connected,
-      downloading: s.dataFlowStatus.downloading,
+      connected: s.connected === true,
+      downloading: s.dataFlowStatus.downloading === true,
       hasSynced: s.hasSynced,
       lastSyncedAt: s.lastSyncedAt ?? null,
       syncStreams: streams,

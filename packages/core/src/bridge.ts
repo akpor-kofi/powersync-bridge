@@ -6,6 +6,7 @@ import { InfiniteListStore } from './infinite';
 import { type OnDemandOptions, OnDemandStreamStore } from './ondemand';
 import { CrudMirror } from './pending';
 import { RacedListStore } from './raced';
+import { InfiniteQueryStore, infiniteQueryKey, type InfiniteQueryOptions } from './query';
 import { type MinimalQueryClient, SnapshotCache } from './snapshots';
 import { SnapshotStore } from './store';
 import type {
@@ -76,6 +77,7 @@ export class Bridge {
   readonly clock: BridgeClock;
   /** Increments on every identity swap; hooks subscribe to re-acquire their stores. */
   readonly epochStore: Store<number>;
+  readonly connectivity = new SnapshotStore<boolean | undefined>(undefined);
 
   private readonly identity = new IdentityTracker();
   private readonly freshness: FreshnessTracker;
@@ -88,6 +90,7 @@ export class Bridge {
   private readonly identityOpts: IdentityKeyOptions;
   private readonly onEvicted: BridgeOptions['onEvicted'];
   private disposed = false;
+  private readonly onNetwork = () => this.setOnline(globalThis.navigator?.onLine);
 
   constructor(opts: BridgeOptions) {
     this.driver = opts.driver;
@@ -108,6 +111,8 @@ export class Bridge {
     this.crud.start();
     this.freshness.onClear(() => this.identity.signalClear());
     this.identity.onChange(() => this.swapEpoch());
+    globalThis.addEventListener?.('online', this.onNetwork);
+    globalThis.addEventListener?.('offline', this.onNetwork);
   }
 
   get epoch(): number {
@@ -116,6 +121,22 @@ export class Bridge {
 
   get identityKey(): string | null {
     return this.identity.currentKey;
+  }
+
+  setOnline(online: boolean | undefined): void {
+    this.connectivity.replace(online);
+  }
+
+  query<T extends { id: string }>(
+    options: InfiniteQueryOptions<T>,
+  ): InfiniteQueryStore<T> {
+    const key = `query:${this.epoch}:${infiniteQueryKey(options)}`;
+    return this.acquire(key, () => new InfiniteQueryStore({
+      driver: this.driver, adapter: this.adapter, crud: this.crud,
+      freshness: this.freshness, snapshots: this.snapshots, clock: this.clock,
+      epoch: this.epoch, identityKey: this.identityKey, apiLegEnabled: true,
+      measure: this.measure, connectivity: this.connectivity,
+    }, options));
   }
 
   /** Resolves once the initial upload-queue read has landed (tests). */
@@ -245,6 +266,8 @@ export class Bridge {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    globalThis.removeEventListener?.('online', this.onNetwork);
+    globalThis.removeEventListener?.('offline', this.onNetwork);
     for (const s of this.stores.values()) s.dispose();
     this.stores.clear();
     this.snapshots.clear();

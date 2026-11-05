@@ -1,10 +1,13 @@
 import { createContext, createElement, useContext, useEffect, useMemo, useSyncExternalStore, type ReactNode } from 'react';
+import { infiniteQueryKey } from 'powersync-bridge';
 import type {
   Bridge,
   FlaggerConfig,
   FlagResult,
   InfiniteListDefinition,
   InfiniteListResult,
+  InfiniteQueryOptions,
+  InfiniteQueryResult,
   OnDemandOptions,
   OnDemandResult,
   OrderKey,
@@ -22,12 +25,44 @@ const BridgeContext = createContext<Bridge | null>(null);
 export interface BridgeProviderProps {
   bridge: Bridge;
   children?: ReactNode;
+  /** Native apps supply their network hook's result once, at the provider. */
+  online?: boolean | undefined;
 }
 
 /** Mount once at app root. Crud-delta observation started at createBridge(), not here (F6-001). */
-export function BridgeProvider({ bridge, children }: BridgeProviderProps) {
+export function BridgeProvider({ bridge, children, online }: BridgeProviderProps) {
+  useEffect(() => { bridge.setOnline(online); }, [bridge, online]);
   return createElement(BridgeContext.Provider, { value: bridge }, children);
 }
+
+export type UseInfiniteQueryResult<T> = InfiniteQueryResult<T> & {
+  fetchNextPage(): void;
+  retry(): void;
+  refresh(): void;
+  refetch(): void;
+  continueOlder(): void;
+};
+
+/** Define local SQL and an API page; the bridge owns all paging and reconciliation. */
+export const useInfiniteQuery = <T extends { id: string }>(
+  options: InfiniteQueryOptions<T>,
+): UseInfiniteQueryResult<T> => {
+  const bridge = useBridge();
+  const epoch = useEpoch(bridge);
+  const key = infiniteQueryKey(options);
+  // Definitions are closures; every changing predicate belongs in queryKey.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const controller = useMemo(() => bridge.query(options), [bridge, epoch, key]);
+  useEffect(() => {
+    controller.retain();
+    return () => controller.release();
+  }, [controller]);
+  const result = useSyncExternalStore(controller.store.subscribe, controller.store.getSnapshot, controller.store.getSnapshot);
+  return useMemo(() => ({
+    ...result, fetchNextPage: controller.fetchNextPage, retry: controller.retry,
+    refresh: controller.refresh, refetch: controller.refresh, continueOlder: controller.continueOlder,
+  }), [result, controller]);
+};
 
 export function useBridge(): Bridge {
   const b = useContext(BridgeContext);

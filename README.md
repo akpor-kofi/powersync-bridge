@@ -1,24 +1,87 @@
 # powersync-bridge
 
-A client-side bridge between a [PowerSync](https://powersync.com) local SQLite database and a
-conventional HTTP API, for web and React Native.
+Local SQLite and your HTTP API, behind one list interface for React and React Native.
 
-The right data source, local synced SQLite or the live API, is a runtime, per-screen decision.
-This package makes it automatic:
+The application defines its SQL, API calls, filters and permissions. The bridge owns racing,
+pagination, pending-write protection, reconciliation, subscriptions, connectivity, retries and
+bounded memory. API results stay in memory; only PowerSync makes records durable offline.
 
-- **`useRacedList`** — paint the first screen from whichever source is *correct* first. A
-  first-ever visit has an empty local table; a warm re-mount has yesterday's checkpoint. The
-  bridge fetches one API snapshot, merges by id with pending-write and freshness awareness,
-  and hands the list to local sync as soon as local is fresh in this session.
-- **`useInfiniteList`** — scroll past the synced window. Older data arrives either through
-  PowerSync sync streams (one equality partition at a time, bounded) or through your API's
-  pages. Row removals are classified as filtered-out, delete, or eviction, so the list never
-  resurrects deletes and never loses content mid-scroll.
-- **`useOnDemandStream`** — pull one record into the offline database by id.
+## Start with `useInfiniteQuery`
 
-Status: **v0 alpha**. Core engine and invariant tests are complete (35 tests on a virtual-time
-fake driver); the PowerSync driver is written against `@powersync/common` 2.3 and needs a running
-integration before GA. Sizes (minified + gzip): core 8.2 kB, React 0.6 kB, driver 1.8 kB.
+```tsx
+import { useInfiniteQuery } from '@powersync-bridge/react';
+
+type Transaction = { id: string; date: string; amount: string };
+
+const transactions = useInfiniteQuery<Transaction>({
+  queryKey: ['transactions', organizationId, filters, permissionVersion],
+  orderBy: ['date', 'id'],
+  // Descending order, 25 rows per page and a 500-row memory window are defaults.
+  query: ({ cursor, limit }) =>
+    db.select().from(transaction)
+      .where(and(
+        eq(transaction.organizationId, organizationId),
+        cursor ? or(
+          lt(transaction.date, cursor.date),
+          and(eq(transaction.date, cursor.date), lt(transaction.id, cursor.id)),
+        ) : undefined,
+      ))
+      .orderBy(desc(transaction.date), desc(transaction.id))
+      .limit(limit),
+  fetchPage: async ({ cursor, limit, signal }) =>
+    api.transactions.list({ organizationId, filters,
+      cursor: cursor ? { date: cursor.date, id: cursor.id } : undefined,
+      limit, signal,
+    }),
+});
+
+// FlatList / virtualized list:
+// data={transactions.data}
+// onEndReached={() => transactions.hasNextPage && transactions.fetchNextPage()}
+// refreshing={transactions.isFetching}
+// onRefresh={transactions.refresh}
+```
+
+The local and API rows must have the same decoded shape and a strict, stable sort order.
+Honor the requested `limit`: the bridge requests one extra row to detect another page.
+`cursor` is the previous API row, never a cursor guessed from a sparse local feed. Local reads
+can fill a requested page while its API request is still pending. Every requested page races;
+API requests follow a single cursor chain, including when scrolling outpaces the network.
+
+`data` contains ordinary rows. `items` additionally exposes each row's source and local presence
+for edit guards. `error` reports an error preventing the requested range from being filled;
+`errors` retains independent local/API diagnostics even when usable rows are displayed.
+`retry()` retries the pending range. `refresh()` / `refetch()` starts again at the current window.
+At `maxRows`, `needsOlderWindow` becomes true when more history may exist; `continueOlder()`
+opens the next bounded window. Changing `queryKey` discards the previous scope.
+
+Include every organization, filter and permission predicate in `queryKey`; the bridge does not
+invent business authorization. It infers the business table for single-table queries. Supply `table`
+for joins or ambiguous queries, or `getRowIdentity(row) => ({ table, id })` for a heterogeneous feed whose display
+IDs differ from the underlying business IDs.
+
+`mapQuery(builder, decode)` preserves ORM metadata when decoding rows. `rawQuery(db,
+{ text, params }, tables, decode)` supports parameterized SQL feeds with explicit source tables.
+Both come from `@powersync-bridge/drizzle`; no application adapter or custom watch is needed.
+
+## Connectivity
+
+Browser connectivity is observed automatically. In React Native, pass the existing network
+hook's boolean once at the provider:
+
+```tsx
+<BridgeProvider bridge={bridge} online={online}>
+  <App />
+</BridgeProvider>
+```
+
+`online` is optional and may be `undefined`. The bridge also handles HTTP failures when a
+connectivity hint incorrectly says online. A disconnected sync socket does not by itself mean
+the API is unavailable. Downloaded rows continue to paginate offline; additional archive rows
+require a connection. Reconnection resumes the pending API range without clearing visible rows.
+
+The lower-level `useRacedList`, `useInfiniteList`, `useOnDemandStream` and `useAutoSync` APIs
+remain available for specialized workflows. Ordinary paginated lists need only `useInfiniteQuery`.
 
 ## What your backend must change
 
@@ -39,7 +102,7 @@ alignment, not a change: your list endpoint sorts rows the same way your local q
 pnpm add powersync-bridge @powersync-bridge/react @powersync-bridge/drizzle @powersync-bridge/powersync
 ```
 
-Peers: `@powersync/common ^2.3`, `@powersync/web ^2.4` or `@powersync/react-native ^2.3`,
+Peers: `@powersync/common ^1.57.3 || ^2.3`, with your compatible web or native SDK,
 `@powersync/drizzle-driver`, `drizzle-orm`, `react ^18.2 || ^19`. TanStack Query is optional.
 
 ## Setup (once, in a plain module)

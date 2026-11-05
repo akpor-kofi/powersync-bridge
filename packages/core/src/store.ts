@@ -13,14 +13,15 @@ export class SnapshotStore<S> implements Store<S> {
     this.snapshot = initial;
   }
 
-  getSnapshot(): S {
+  // React invokes external-store callbacks as standalone functions.
+  readonly getSnapshot = (): S => {
     return this.snapshot;
-  }
+  };
 
-  subscribe(listener: () => void): () => void {
+  readonly subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
-  }
+  };
 
   replace(next: S): void {
     if (Object.is(next, this.snapshot)) return;
