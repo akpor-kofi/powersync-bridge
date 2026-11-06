@@ -3,6 +3,7 @@ import { idOf, keyColumns, rowComparator } from './keyset';
 import type { PendingWindow } from './pending';
 import type { RacedDeps } from './raced';
 import { classifyRemovals } from './removal';
+import { CoalescedRefresh } from './refresh';
 import { SnapshotStore, shallowEqualResult } from './store';
 import type { ListErrors, OrderKey, PagedRow, RowsBuilder, Store } from './types';
 
@@ -16,7 +17,9 @@ export interface InfiniteQueryOptions<T extends { id: string }> {
   readonly queryKey: readonly unknown[];
   readonly query: (page: QueryPage<T>) => RowsBuilder<T>;
   /** Return rows in the same order as SQLite. Honor limit, including its lookahead row. */
-  readonly fetchPage: (page: QueryPage<T> & { readonly signal: AbortSignal }) => Promise<readonly T[]>;
+  readonly fetchPage: (
+    page: QueryPage<T> & { readonly signal: AbortSignal },
+  ) => Promise<readonly T[]>;
   readonly orderBy: OrderKey<T>;
   readonly direction?: 'asc' | 'desc';
   readonly pageSize?: number;
@@ -30,7 +33,9 @@ export interface InfiniteQueryOptions<T extends { id: string }> {
 }
 
 /** Shared by core and React so changing page configuration cannot reuse an incompatible store. */
-export const infiniteQueryKey = <T extends { id: string }>(options: InfiniteQueryOptions<T>): string =>
+export const infiniteQueryKey = <T extends { id: string }>(
+  options: InfiniteQueryOptions<T>,
+): string =>
   JSON.stringify([
     options.queryKey,
     options.orderBy,
@@ -100,6 +105,9 @@ export class InfiniteQueryStore<T extends { id: string }> {
   private watchGeneration = 0;
   private lastLocalWatch = 0;
   private refs = 0;
+  private activeRefs = 0;
+  private readonly checkpointRefresh: CoalescedRefresh;
+  private localAbort = new AbortController();
   private ready = false;
   private disposed = false;
   private unwatch: (() => void) | undefined;
@@ -119,23 +127,36 @@ export class InfiniteQueryStore<T extends { id: string }> {
       !Number.isInteger(this.maxRows) ||
       this.maxRows < this.pageSize
     )
-      throw new Error('powersync-bridge: pageSize must be positive and maxRows must be at least pageSize');
+      throw new Error(
+        'powersync-bridge: pageSize must be positive and maxRows must be at least pageSize',
+      );
     this.target = this.pageSize;
     this.compare = rowComparator(options.orderBy, options.direction ?? 'desc');
     this.table = options.table;
     this.offline = this.readOffline();
     this.store = new SnapshotStore(this.result());
+    this.checkpointRefresh = new CoalescedRefresh(
+      (isCurrent) => this.checkpoint(isCurrent),
+      () => this.render(),
+    );
   }
 
   get isDisposed(): boolean {
     return this.disposed || (this.refs <= 0 && this.unwatch !== undefined);
   }
-  retain(): void {
+  retain(active = true): void {
     this.refs += 1;
-    if (this.refs !== 1 || this.unwatch || this.options.enabled === false) return;
+    if (active) this.activeRefs += 1;
+    if (this.activeRefs <= 0 || this.unwatch || this.options.enabled === false || this.disposed)
+      return;
+    this.offline = this.readOffline();
+    this.apiFailed = false;
+    this.apiError = undefined;
     this.stops = [
       this.deps.crud.onChange(() => this.render()),
-      this.deps.freshness.onCompletion(() => void this.checkpoint()),
+      this.deps.freshness.onCompletion((completion) => {
+        if (completion.stream === null) this.checkpointRefresh.request();
+      }),
       this.deps.driver.onStatusChanged(() => this.networkChanged()),
       this.deps.connectivity.subscribe(() => this.networkChanged()),
     ];
@@ -153,12 +174,13 @@ export class InfiniteQueryStore<T extends { id: string }> {
         this.render();
       });
   }
-  release(): void {
+  release(active = true): void {
     this.refs -= 1;
-    if (this.refs <= 0)
-      queueMicrotask(() => {
-        if (this.refs <= 0) this.dispose();
-      });
+    if (active) this.activeRefs -= 1;
+    queueMicrotask(() => {
+      if (this.refs <= 0) this.dispose();
+      else if (this.activeRefs <= 0) this.pause();
+    });
   }
   swapRoot(): void {
     this.disposed = true;
@@ -169,13 +191,7 @@ export class InfiniteQueryStore<T extends { id: string }> {
   }
   dispose(): void {
     this.disposed = true;
-    this.generation += 1;
-    this.watchGeneration += 1;
-    this.cancelRequest();
-    this.unwatch?.();
-    this.unwatch = undefined;
-    for (const stop of this.stops) stop();
-    this.stops = [];
+    this.pause();
     this.clearPages();
     this.local.clear();
     this.retained.clear();
@@ -183,6 +199,19 @@ export class InfiniteQueryStore<T extends { id: string }> {
     this.filtered.clear();
     this.inSession.clear();
     this.render(true);
+  }
+  private pause(): void {
+    this.generation += 1;
+    this.watchGeneration += 1;
+    this.checkpointRefresh.cancel();
+    this.localAbort.abort();
+    this.cancelRequest();
+    this.request = undefined;
+    this.apiPending = false;
+    this.unwatch?.();
+    this.unwatch = undefined;
+    for (const stop of this.stops) stop();
+    this.stops = [];
   }
 
   private readOffline(): boolean {
@@ -203,6 +232,7 @@ export class InfiniteQueryStore<T extends { id: string }> {
       this.generation += 1;
       this.apiPending = false;
       this.request = undefined;
+      this.watch();
     }
     if (reconnect) {
       this.apiFailed = false;
@@ -230,7 +260,11 @@ export class InfiniteQueryStore<T extends { id: string }> {
     return this.options.query({ cursor: this.anchor, limit: this.target + 1 });
   }
   private watch(): void {
+    if (this.activeRefs <= 0 || this.disposed) return;
     this.unwatch?.();
+    this.localAbort.abort();
+    this.localAbort = new AbortController();
+    this.checkpointRefresh.cancel();
     const token = ++this.watchGeneration;
     const generation = this.generation;
     this.localPending = true;
@@ -251,14 +285,16 @@ export class InfiniteQueryStore<T extends { id: string }> {
     this.unwatch = this.deps.driver.diffs(prepared).subscribe(
       (diff) => {
         void this.acceptLocal(diff.all, token, generation).catch((error: unknown) => {
-          if (token !== this.watchGeneration || generation !== this.generation || this.disposed) return;
+          if (token !== this.watchGeneration || generation !== this.generation || this.disposed)
+            return;
           this.localPending = false;
           this.localError = error instanceof Error ? error : new Error(String(error));
           this.render();
         });
       },
       (error) => {
-        if (token !== this.watchGeneration || generation !== this.generation || this.disposed) return;
+        if (token !== this.watchGeneration || generation !== this.generation || this.disposed)
+          return;
         this.localPending = false;
         this.localError = error;
         this.render();
@@ -266,9 +302,21 @@ export class InfiniteQueryStore<T extends { id: string }> {
     );
     this.render();
   }
-  private async acceptLocal(rows: readonly T[], token: number, generation: number): Promise<void> {
+  private async acceptLocal(
+    rows: readonly T[],
+    token: number,
+    generation: number,
+    stamp = this.deps.freshness.freshAtFor(undefined),
+    isCurrent: () => boolean = () => true,
+  ): Promise<void> {
     await this.deps.crud.resync();
-    if (token !== this.watchGeneration || generation !== this.generation || this.disposed) return;
+    if (
+      token !== this.watchGeneration ||
+      generation !== this.generation ||
+      this.disposed ||
+      !isCurrent()
+    )
+      return;
     const previous = this.local;
     const firstEmission = this.lastLocalWatch !== token;
     this.lastLocalWatch = token;
@@ -294,7 +342,7 @@ export class InfiniteQueryStore<T extends { id: string }> {
     this.local = next;
     this.localPending = false;
     this.localError = undefined;
-    this.localStamp = this.deps.freshness.freshAtFor(undefined);
+    this.localStamp = stamp;
     this.render();
     // Probe by business table, including heterogeneous feeds whose display IDs are composite.
     const groups = new Map<string, Map<string, T>>();
@@ -316,7 +364,8 @@ export class InfiniteQueryStore<T extends { id: string }> {
           },
           group,
         );
-        if (token !== this.watchGeneration || generation !== this.generation || this.disposed) return;
+        if (token !== this.watchGeneration || generation !== this.generation || this.disposed)
+          return;
         for (const row of removed.values()) {
           const identity = this.identity(row);
           if (identity.table !== table || this.local.has(row.id)) continue;
@@ -350,15 +399,31 @@ export class InfiniteQueryStore<T extends { id: string }> {
     }
     this.render();
   }
-  private async checkpoint(): Promise<void> {
-    if (this.disposed || !this.unwatch) return;
+  private async checkpoint(isCurrent: () => boolean): Promise<void> {
+    if (this.disposed || !this.unwatch || this.activeRefs <= 0) return;
     const token = this.watchGeneration;
     const generation = this.generation;
+    const stamp = this.deps.freshness.freshAtFor(undefined);
     try {
-      const rows = await this.deps.driver.query(this.deps.adapter.prepare(this.localBuilder()));
-      await this.acceptLocal(rows, token, generation);
+      const signal = this.localAbort.signal;
+      const read = () =>
+        isCurrent()
+          ? this.deps.driver.query(this.deps.adapter.prepare(this.localBuilder()), signal)
+          : Promise.resolve(undefined);
+      const rows = await (this.deps.backgroundReads
+        ? this.deps.backgroundReads.run(read, signal)
+        : read());
+      if (!rows) return;
+      if (!isCurrent()) return;
+      await this.acceptLocal(rows, token, generation, stamp, isCurrent);
     } catch (error) {
-      if (token !== this.watchGeneration || generation !== this.generation || this.disposed) return;
+      if (
+        token !== this.watchGeneration ||
+        generation !== this.generation ||
+        this.disposed ||
+        !isCurrent()
+      )
+        return;
       this.localError = error instanceof Error ? error : new Error(String(error));
       this.render();
     }
@@ -385,6 +450,7 @@ export class InfiniteQueryStore<T extends { id: string }> {
   private pump(): void {
     if (
       !this.ready ||
+      this.activeRefs <= 0 ||
       this.disposed ||
       this.options.enabled === false ||
       this.offline ||
@@ -441,7 +507,9 @@ export class InfiniteQueryStore<T extends { id: string }> {
           const before = rows[index - 1];
           const row = rows[index];
           if (before && row && this.compare(before, row) >= 0)
-            throw new Error('powersync-bridge: API rows must use a strict, stable order with an id tiebreaker');
+            throw new Error(
+              'powersync-bridge: API rows must use a strict, stable order with an id tiebreaker',
+            );
         }
         if (cursor !== undefined && rows.some((row) => this.compare(row, cursor) <= 0))
           throw new Error('powersync-bridge: API page must advance beyond the supplied cursor');
@@ -513,7 +581,8 @@ export class InfiniteQueryStore<T extends { id: string }> {
     const errors: ListErrors = {};
     if (this.localError) errors.local = this.localError;
     if (this.apiError) errors.api = this.apiError;
-    const offlineError = this.offline && missing && !this.localPending ? new OfflineError() : undefined;
+    const offlineError =
+      this.offline && missing && !this.localPending ? new OfflineError() : undefined;
     const error =
       enabled && missing && !this.localPending && !this.apiPending
         ? (this.localError ?? this.apiError ?? offlineError)
@@ -523,7 +592,8 @@ export class InfiniteQueryStore<T extends { id: string }> {
       items,
       isLoading: enabled && items.length === 0 && !error && (this.localPending || this.apiPending),
       isFetching: enabled && (this.localPending || this.apiPending),
-      isFetchingNextPage: enabled && this.target > this.pageSize && (this.localPending || this.apiPending),
+      isFetchingNextPage:
+        enabled && this.target > this.pageSize && (this.localPending || this.apiPending),
       hasNextPage: enabled && this.target < this.maxRows && more,
       needsOlderWindow: enabled && items.length >= this.maxRows && more,
       error,
@@ -544,14 +614,20 @@ export class InfiniteQueryStore<T extends { id: string }> {
       this.store.replace(result);
   }
   readonly fetchNextPage = (): void => {
-    if (this.disposed || this.options.enabled === false || this.target >= this.maxRows) return;
+    if (
+      this.disposed ||
+      this.activeRefs <= 0 ||
+      this.options.enabled === false ||
+      this.target >= this.maxRows
+    )
+      return;
     if (!this.store.getSnapshot().hasNextPage) return;
     this.target = Math.min(this.target + this.pageSize, this.maxRows);
     this.watch();
     this.pump();
   };
   readonly retry = (): void => {
-    if (this.disposed || this.options.enabled === false) return;
+    if (this.disposed || this.activeRefs <= 0 || this.options.enabled === false) return;
     this.apiFailed = false;
     this.apiError = undefined;
     this.watch();
@@ -565,7 +641,7 @@ export class InfiniteQueryStore<T extends { id: string }> {
     if (last) this.reset(last);
   };
   private reset(anchor: T | undefined): void {
-    if (this.disposed || this.options.enabled === false) return;
+    if (this.disposed || this.activeRefs <= 0 || this.options.enabled === false) return;
     this.generation += 1;
     this.cancelRequest();
     this.request = undefined;

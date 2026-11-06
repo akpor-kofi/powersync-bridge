@@ -1,10 +1,16 @@
 import { type BridgeClock, realClock } from './clock';
 import { type FlaggerConfig, AutoSyncFlagStore } from './flagger';
 import { FreshnessTracker } from './freshness';
-import { IdentityTracker, type IdentityKeyOptions, identityKeyFromClaims, identityKeyFromToken } from './identity';
+import {
+  IdentityTracker,
+  type IdentityKeyOptions,
+  identityKeyFromClaims,
+  identityKeyFromToken,
+} from './identity';
 import { InfiniteListStore } from './infinite';
 import { type OnDemandOptions, OnDemandStreamStore } from './ondemand';
 import { CrudMirror } from './pending';
+import { BackgroundReads } from './refresh';
 import { RacedListStore } from './raced';
 import { InfiniteQueryStore, infiniteQueryKey, type InfiniteQueryOptions } from './query';
 import { type MinimalQueryClient, SnapshotCache } from './snapshots';
@@ -83,6 +89,7 @@ export class Bridge {
   private readonly freshness: FreshnessTracker;
   private readonly crud: CrudMirror;
   private readonly snapshots: SnapshotCache;
+  private readonly backgroundReads = new BackgroundReads();
   private readonly epochSnapshot: SnapshotStore<number>;
   private readonly stores = new Map<string, Disposable>();
   private readonly gates: Required<PlatformGates>;
@@ -97,7 +104,10 @@ export class Bridge {
     this.adapter = opts.adapter;
     this.clock = opts.clock ?? realClock;
     this.platform = opts.platform ?? detectPlatform();
-    this.gates = { native: opts.platformGates?.native ?? 'local-first', web: opts.platformGates?.web ?? 'race' };
+    this.gates = {
+      native: opts.platformGates?.native ?? 'local-first',
+      web: opts.platformGates?.web ?? 'race',
+    };
     this.measure = opts.measure?.sink;
     this.identityOpts = opts.identity ?? {};
     this.onEvicted = opts.onEvicted;
@@ -127,16 +137,29 @@ export class Bridge {
     this.connectivity.replace(online);
   }
 
-  query<T extends { id: string }>(
-    options: InfiniteQueryOptions<T>,
-  ): InfiniteQueryStore<T> {
+  query<T extends { id: string }>(options: InfiniteQueryOptions<T>): InfiniteQueryStore<T> {
     const key = `query:${this.epoch}:${infiniteQueryKey(options)}`;
-    return this.acquire(key, () => new InfiniteQueryStore({
-      driver: this.driver, adapter: this.adapter, crud: this.crud,
-      freshness: this.freshness, snapshots: this.snapshots, clock: this.clock,
-      epoch: this.epoch, identityKey: this.identityKey, apiLegEnabled: true,
-      measure: this.measure, connectivity: this.connectivity,
-    }, options));
+    return this.acquire(
+      key,
+      () =>
+        new InfiniteQueryStore(
+          {
+            driver: this.driver,
+            adapter: this.adapter,
+            crud: this.crud,
+            freshness: this.freshness,
+            snapshots: this.snapshots,
+            clock: this.clock,
+            epoch: this.epoch,
+            identityKey: this.identityKey,
+            apiLegEnabled: true,
+            measure: this.measure,
+            connectivity: this.connectivity,
+            backgroundReads: this.backgroundReads,
+          },
+          options,
+        ),
+    );
   }
 
   /** Resolves once the initial upload-queue read has landed (tests). */
@@ -154,7 +177,8 @@ export class Bridge {
     Object.defineProperty(wrapped, 'fetchCredentials', {
       value: async () => {
         const creds = await connector.fetchCredentials();
-        if (creds?.token) this.identity.observe(identityKeyFromToken(creds.token, this.identityOpts));
+        if (creds?.token)
+          this.identity.observe(identityKeyFromToken(creds.token, this.identityOpts));
         return creds;
       },
       configurable: true,
@@ -213,24 +237,27 @@ export class Bridge {
   ): RacedListStore<TItem, TScope, TApi, K> {
     const scopeKey = scopeKeyOf(scope);
     const key = `raced:${this.epoch}:${def.id}:${scopeKey}`;
-    return this.acquire(key, () =>
-      new RacedListStore<TItem, TScope, TApi, K>(
-        {
-          driver: this.driver,
-          adapter: this.adapter,
-          crud: this.crud,
-          freshness: this.freshness,
-          snapshots: this.snapshots,
-          clock: this.clock,
-          epoch: this.epoch,
-          identityKey: this.identityKey,
-          apiLegEnabled: this.apiLegEnabled(),
-          measure: this.measure,
-        },
-        def,
-        scope,
-        scopeKey,
-      ),
+    return this.acquire(
+      key,
+      () =>
+        new RacedListStore<TItem, TScope, TApi, K>(
+          {
+            driver: this.driver,
+            adapter: this.adapter,
+            crud: this.crud,
+            freshness: this.freshness,
+            snapshots: this.snapshots,
+            clock: this.clock,
+            epoch: this.epoch,
+            identityKey: this.identityKey,
+            apiLegEnabled: this.apiLegEnabled(),
+            measure: this.measure,
+            backgroundReads: this.backgroundReads,
+          },
+          def,
+          scope,
+          scopeKey,
+        ),
     );
   }
 
@@ -239,23 +266,28 @@ export class Bridge {
     scope: TScope,
   ): InfiniteListStore<TItem, TScope, K, TCursor, TPartition> {
     const key = `infinite:${this.epoch}:${def.id}:${scopeKeyOf(scope)}`;
-    return this.acquire(key, () =>
-      new InfiniteListStore<TItem, TScope, K, TCursor, TPartition>(
-        {
-          driver: this.driver,
-          adapter: this.adapter,
-          clock: this.clock,
-          onEvicted: this.onEvicted ? (ids) => this.onEvicted?.(def.id, ids) : undefined,
-        },
-        def,
-        scope,
-      ),
+    return this.acquire(
+      key,
+      () =>
+        new InfiniteListStore<TItem, TScope, K, TCursor, TPartition>(
+          {
+            driver: this.driver,
+            adapter: this.adapter,
+            clock: this.clock,
+            onEvicted: this.onEvicted ? (ids) => this.onEvicted?.(def.id, ids) : undefined,
+          },
+          def,
+          scope,
+        ),
     );
   }
 
   onDemand(name: string, params: Params | null, opts: OnDemandOptions = {}): OnDemandStreamStore {
     const key = `ondemand:${this.epoch}:${name}:${JSON.stringify(params)}`;
-    return this.acquire(key, () => new OnDemandStreamStore(this.driver, this.clock, name, params, opts));
+    return this.acquire(
+      key,
+      () => new OnDemandStreamStore(this.driver, this.clock, name, params, opts),
+    );
   }
 
   autoSync(config: FlaggerConfig, ids: readonly string[]): AutoSyncFlagStore {

@@ -33,7 +33,6 @@ export class FreshnessTracker {
   private lastHasSynced: boolean | undefined = undefined;
   private readonly streamFreshAt = new Map<string, number>();
   private readonly streamSeenSyncedAt = new Map<string, number>();
-  private readonly completions: CheckpointCompletion[] = [];
   private readonly completionListeners = new Set<(c: CheckpointCompletion) => void>();
   private readonly clearListeners = new Set<() => void>();
   private unsubscribe: (() => void) | null = null;
@@ -76,7 +75,6 @@ export class FreshnessTracker {
     this.lastSeenSyncedAt = null;
     this.streamFreshAt.clear();
     this.streamSeenSyncedAt.clear();
-    this.completions.length = 0;
   }
 
   get sessionConnectAtMs(): number | null {
@@ -164,7 +162,6 @@ export class FreshnessTracker {
     this.prevCompletionAt = now;
     this.lastDownloadStart = null; // consumed; the next stamp derives from this completion
     const c: CheckpointCompletion = { stamp: this.localFreshAt, completedAt: now, stream };
-    this.completions.push(c);
     for (const l of this.completionListeners) l(c);
   }
 }

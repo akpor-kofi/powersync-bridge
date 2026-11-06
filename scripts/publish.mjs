@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,6 +18,25 @@ const run = (command, args, cwd = root) => {
   if (result.status !== 0) throw new Error(`${command} failed with exit code ${result.status}`);
 };
 
+// Tar/gzip headers can differ between packers even when every packaged file is identical.
+// Compare complete file contents before skipping an existing version; never overwrite it.
+const sameContents = (left, right) => {
+  const entries = (path) => {
+    const result = spawnSync('tar', ['-tzf', path], { encoding: 'utf8' });
+    if (result.status !== 0) throw new Error('Unable to inspect package archive.');
+    return result.stdout.trim().split('\n').filter((name) => !name.endsWith('/')).sort();
+  };
+  const names = entries(left);
+  if (JSON.stringify(names) !== JSON.stringify(entries(right))) return false;
+  return names.every((name) => {
+    if (!name.startsWith('package/')) throw new Error('Unexpected package archive path.');
+    const a = spawnSync('tar', ['-xOf', left, '--', name], { maxBuffer: 32 * 1024 * 1024 });
+    const b = spawnSync('tar', ['-xOf', right, '--', name], { maxBuffer: 32 * 1024 * 1024 });
+    if (a.status !== 0 || b.status !== 0) throw new Error('Unable to compare package archive.');
+    return a.stdout.equals(b.stdout);
+  });
+};
+
 // Inherit the caller's terminal: npm can request 2FA without an OTP in arguments, logs or files.
 for (const directory of directories) {
   const args = ['pack', '--pack-destination', destination];
@@ -32,8 +51,16 @@ for (const artifact of readdirSync(destination).filter((name) => name.endsWith('
   const existing = spawnSync('npm', ['view', `${manifest.name}@${manifest.version}`, 'dist.integrity', '--json'], { cwd: root, encoding: 'utf8' });
   if (existing.status === 0) {
     const integrity = `sha512-${createHash('sha512').update(readFileSync(path)).digest('base64')}`;
-    if (JSON.parse(existing.stdout) !== integrity) throw new Error(`${manifest.name}@${manifest.version} already exists with different contents; choose a new version.`);
-    console.log(`${manifest.name}@${manifest.version} is already published with this integrity.`);
+    if (JSON.parse(existing.stdout) !== integrity) {
+      const metadata = spawnSync('npm', ['view', `${manifest.name}@${manifest.version}`, 'dist.tarball', '--json'], { cwd: root, encoding: 'utf8' });
+      if (metadata.status !== 0) throw new Error('Unable to read published artifact location.');
+      const response = await fetch(JSON.parse(metadata.stdout));
+      if (!response.ok) throw new Error(`Unable to download published artifact: ${response.status}`);
+      const publishedPath = join(destination, `published-${artifact}`);
+      writeFileSync(publishedPath, Buffer.from(await response.arrayBuffer()));
+      if (!sameContents(path, publishedPath)) throw new Error(`${manifest.name}@${manifest.version} already exists with different contents; choose a new version.`);
+    }
+    console.log(`${manifest.name}@${manifest.version} is already published with identical package contents.`);
     continue;
   }
   if (!existing.stderr.includes('E404')) throw new Error(existing.stderr || 'Unable to check the npm registry.');

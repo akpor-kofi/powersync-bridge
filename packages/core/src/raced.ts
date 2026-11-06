@@ -1,8 +1,9 @@
 import type { BridgeClock } from './clock';
-import type { FreshnessTracker } from './freshness';
+import { streamKey, type FreshnessTracker } from './freshness';
 import { cursorOfRow, idOf, rowComparator } from './keyset';
 import type { CrudMirror, PendingWindow } from './pending';
 import { classifyRemovals } from './removal';
+import { BackgroundReads, CoalescedRefresh } from './refresh';
 import type { SnapshotCache, SnapshotRecord } from './snapshots';
 import { SnapshotStore, shallowEqualResult } from './store';
 import type {
@@ -31,6 +32,7 @@ export interface RacedDeps {
   readonly identityKey: string | null;
   readonly apiLegEnabled: boolean;
   readonly measure: MeasureSink | undefined;
+  readonly backgroundReads?: BackgroundReads;
 }
 
 interface Snap<TItem> {
@@ -64,7 +66,10 @@ export class RacedListStore<TItem, TScope, TApi, K extends OrderKey<TItem>> {
 
   private readonly compare: (a: TItem, b: TItem) => number;
   private readonly table: string;
-  private readonly abort = new AbortController();
+  private abort = new AbortController();
+  private observation = 0;
+  private readonly checkpointRefresh: CoalescedRefresh;
+  private localFreshAt = Number.NEGATIVE_INFINITY;
   private readonly startedAt: number;
 
   private snap: Snap<TItem> | null = null;
@@ -87,6 +92,7 @@ export class RacedListStore<TItem, TScope, TApi, K extends OrderKey<TItem>> {
 
   private disposed = false;
   private refs = 0;
+  private activeRefs = 0;
   private measured = false;
   private localMs: number | null = null;
   private apiMs: number | null = null;
@@ -100,16 +106,25 @@ export class RacedListStore<TItem, TScope, TApi, K extends OrderKey<TItem>> {
     this.compare = rowComparator<TItem>(def.orderKey, def.direction ?? 'asc');
     this.table = def.table ?? def.id;
     this.startedAt = deps.clock.now();
+    this.checkpointRefresh = new CoalescedRefresh(
+      (isCurrent) => this.onCompletion(isCurrent),
+      () => this.reconcile(),
+    );
   }
 
-  retain(): void {
+  retain(active = true): void {
     this.refs += 1;
-    if (this.refs === 1 && this.unsubDiffs === null) this.start();
+    if (active) this.activeRefs += 1;
+    if (this.activeRefs > 0 && this.unsubDiffs === null) this.start();
   }
 
-  release(): void {
+  release(active = true): void {
     this.refs -= 1;
-    if (this.refs <= 0) queueMicrotask(() => { if (this.refs <= 0) this.dispose(); });
+    if (active) this.activeRefs -= 1;
+    queueMicrotask(() => {
+      if (this.refs <= 0) this.dispose();
+      else if (this.activeRefs <= 0) this.pause();
+    });
   }
 
   get isDisposed(): boolean {
@@ -124,10 +139,7 @@ export class RacedListStore<TItem, TScope, TApi, K extends OrderKey<TItem>> {
 
   dispose(): void {
     this.disposed = true;
-    this.abort.abort(new Error('disposed'));
-    this.unsubDiffs?.();
-    this.unsubCrud?.();
-    this.unsubFresh?.();
+    this.pause();
     if (this.snapWindow) this.deps.crud.closeWindow(this.snapWindow);
     this.snapWindow = null;
     this.local?.clear();
@@ -140,45 +152,83 @@ export class RacedListStore<TItem, TScope, TApi, K extends OrderKey<TItem>> {
     this.store.replace(emptyRacedResult<TItem>());
   }
 
+  private pause(): void {
+    this.observation += 1;
+    this.checkpointRefresh.cancel();
+    this.abort.abort(new Error('observer stopped'));
+    this.unsubDiffs?.();
+    this.unsubCrud?.();
+    this.unsubFresh?.();
+    this.unsubDiffs = null;
+    this.unsubCrud = null;
+    this.unsubFresh = null;
+    if (this.snapPending) {
+      this.deps.snapshots.invalidate(this.snapshotKey());
+      if (this.snapWindow) this.deps.crud.closeWindow(this.snapWindow);
+      this.snapWindow = this.snap?.window ?? null;
+      this.snapPending = false;
+    }
+  }
+
   // ---------------------------------------------------------------------------
 
   private start(): void {
+    if (this.disposed) return;
+    this.abort = new AbortController();
+    const observation = ++this.observation;
     const { driver, adapter, crud, freshness } = this.deps;
     const prepared: PreparedQuery<TItem> = adapter.prepare(this.def.query(this.scope));
     this.prepared = prepared;
     this.unsubDiffs = driver.diffs(prepared).subscribe(
-      (diff) => void this.onDiff(diff),
+      (diff) => {
+        if (observation === this.observation) void this.onDiff(diff);
+      },
       (err) => {
+        if (observation !== this.observation) return;
         this.localError = err;
         this.reconcile();
       },
     );
     this.unsubCrud = crud.onChange(() => this.reconcile());
-    this.unsubFresh = freshness.onCompletion(() => void this.onCompletion());
+    this.unsubFresh = freshness.onCompletion((completion) => {
+      // Unscoped queries only gain freshness from a global checkpoint. Other
+      // streams must not enqueue the same aggregate read for each subscription.
+      if (
+        completion.stream === null ||
+        (this.def.stream && completion.stream === streamKey(this.def.stream))
+      ) {
+        if (!this.owned) this.checkpointRefresh.request();
+      }
+    });
 
-    if (this.deps.apiLegEnabled) this.startApiLeg();
+    if (this.deps.apiLegEnabled && !this.owned) this.startApiLeg();
     this.reconcile();
   }
 
   private startApiLeg(): void {
+    const observation = this.observation;
+    const abort = this.abort;
     const { snapshots, crud } = this.deps;
     const staleTime = this.def.staleTime ?? 10 * 60_000;
     this.snapPending = true;
     // The window is opened at request time and seeded with the live set (F4-001).
     const window = crud.openWindow();
     this.snapWindow = window;
-    const key = ['powersync-bridge', this.deps.identityKey, this.deps.epoch, this.def.id, this.scopeKey] as const;
+    const key = this.snapshotKey();
     snapshots
       .fetch<TApi>(key, staleTime, (signal) => {
         const combined = new AbortController();
         const onAbort = () => combined.abort();
         signal.addEventListener('abort', onAbort, { once: true });
-        this.abort.signal.addEventListener('abort', onAbort, { once: true });
-        return this.def.fetchSnapshot(this.scope, combined.signal);
+        abort.signal.addEventListener('abort', onAbort, { once: true });
+        return this.def.fetchSnapshot(this.scope, combined.signal).finally(() => {
+          signal.removeEventListener('abort', onAbort);
+          abort.signal.removeEventListener('abort', onAbort);
+        });
       })
       .then(
         (record) => {
-          if (this.disposed) return;
+          if (this.disposed || observation !== this.observation) return;
           this.snapPending = false;
           this.apiMs = this.deps.clock.now() - this.startedAt;
           const rows = new Map<string, TItem>();
@@ -186,18 +236,23 @@ export class RacedListStore<TItem, TScope, TApi, K extends OrderKey<TItem>> {
             const item = this.def.mapApi(raw);
             rows.set(idOf(item), item);
           }
+          if (this.snap) crud.closeWindow(this.snap.window);
           this.snap = { rows, record, window };
           this.reconcile();
         },
         (err: unknown) => {
-          if (this.disposed) return;
+          if (this.disposed || observation !== this.observation) return;
           this.snapPending = false;
           this.snapError = err instanceof Error ? err : new Error(String(err));
           crud.closeWindow(window);
-          this.snapWindow = null;
+          this.snapWindow = this.snap?.window ?? null;
           this.reconcile();
         },
       );
+  }
+
+  private snapshotKey(): readonly unknown[] {
+    return ['powersync-bridge', this.deps.identityKey, this.deps.epoch, this.def.id, this.scopeKey];
   }
 
   /**
@@ -205,26 +260,37 @@ export class RacedListStore<TItem, TScope, TApi, K extends OrderKey<TItem>> {
    * ordering guarantee; taking ownership on the stale local map would render the pre-checkpoint
    * value for one frame (fresh→old→fresh). Pre-ownership we re-query once, then reconcile.
    */
-  private async onCompletion(): Promise<void> {
-    if (this.disposed || this.owned || !this.prepared || !this.emissionSeen) {
-      this.reconcile();
-      return;
-    }
+  private async onCompletion(isCurrent: () => boolean): Promise<void> {
+    if (this.disposed || this.owned || !this.prepared || this.activeRefs <= 0) return;
+    const freshAt = this.deps.freshness.freshAtFor(this.def.stream);
     try {
-      const rows = await this.deps.driver.query(this.prepared, this.abort.signal);
-      if (this.disposed) return;
+      const prepared = this.prepared;
+      const signal = this.abort.signal;
+      const read = () =>
+        isCurrent() ? this.deps.driver.query(prepared, signal) : Promise.resolve(undefined);
+      const rows = await (this.deps.backgroundReads
+        ? this.deps.backgroundReads.run(read, signal)
+        : read());
+      if (!rows) return;
+      if (this.disposed || !isCurrent()) return;
       const prev = this.local ?? new Map<string, TItem>();
       const next = new Map<string, TItem>();
       for (const row of rows) {
         const id = idOf(row);
         next.set(id, row);
         const before = prev.get(id);
-        if ((before === undefined || JSON.stringify(before) !== JSON.stringify(row)) && !this.deps.crud.isLivePending(this.table, id)) {
+        if (
+          (before === undefined || JSON.stringify(before) !== JSON.stringify(row)) &&
+          !this.deps.crud.isLivePending(this.table, id)
+        ) {
           this.inSession.add(id);
           this.tombstones.delete(id);
         }
       }
       this.local = next;
+      this.localFreshAt = Math.max(this.localFreshAt, freshAt);
+      this.emissionSeen = true;
+      this.localError = undefined;
     } catch {
       // keep the last emission; the diff stream will catch up
     }
@@ -232,7 +298,8 @@ export class RacedListStore<TItem, TScope, TApi, K extends OrderKey<TItem>> {
   }
 
   private async onDiff(diff: RowDiff<TItem>): Promise<void> {
-    if (this.disposed) return;
+    if (this.disposed || this.activeRefs <= 0) return;
+    const observation = this.observation;
     const { crud } = this.deps;
     const prev = this.local;
     const next = new Map<string, TItem>();
@@ -247,6 +314,8 @@ export class RacedListStore<TItem, TScope, TApi, K extends OrderKey<TItem>> {
       }
     }
     this.local = next;
+    if (!this.checkpointRefresh.pending)
+      this.localFreshAt = this.deps.freshness.freshAtFor(this.def.stream);
     if (!this.emissionSeen) {
       this.emissionSeen = true;
       this.localMs = this.deps.clock.now() - this.startedAt;
@@ -257,16 +326,19 @@ export class RacedListStore<TItem, TScope, TApi, K extends OrderKey<TItem>> {
 
     if (this.owned && prev) {
       const removed = new Map<string, TItem>();
-      for (const id of diff.removed) {
-        const row = prev.get(id);
-        if (row) removed.set(id, row);
-      }
-      if (removed.size > 0) await this.applyRemovals(removed);
+      // A resumed watch emits a fresh baseline, so its removed[] is empty even
+      // when rows disappeared while paused.
+      for (const [id, row] of prev) if (!next.has(id)) removed.set(id, row);
+      if (removed.size > 0) await this.applyRemovals(removed, observation);
     }
+    if (observation !== this.observation) return;
     this.reconcile();
   }
 
-  private async applyRemovals(removed: ReadonlyMap<string, TItem>): Promise<void> {
+  private async applyRemovals(
+    removed: ReadonlyMap<string, TItem>,
+    observation: number,
+  ): Promise<void> {
     const classes = await classifyRemovals(
       {
         driver: this.deps.driver,
@@ -277,7 +349,7 @@ export class RacedListStore<TItem, TScope, TApi, K extends OrderKey<TItem>> {
       },
       removed,
     );
-    if (this.disposed) return;
+    if (this.disposed || observation !== this.observation) return;
     for (const [id, cls] of classes) {
       const entry = this.overlay.get(id);
       switch (cls) {
@@ -302,21 +374,29 @@ export class RacedListStore<TItem, TScope, TApi, K extends OrderKey<TItem>> {
     if (this.disposed) return;
     const result = this.owned ? this.renderOwned() : this.renderRace();
     const prev = this.store.getSnapshot();
-    if (shallowEqualResult(prev as unknown as Record<string, unknown>, result as unknown as Record<string, unknown>)) return;
+    if (
+      shallowEqualResult(
+        prev as unknown as Record<string, unknown>,
+        result as unknown as Record<string, unknown>,
+      )
+    )
+      return;
     this.store.replace(result);
     this.report(result);
   }
 
   private freshAt(): number {
-    return this.deps.freshness.freshAtFor(this.def.stream);
+    return this.localFreshAt;
   }
 
   private localFresh(): boolean {
-    return this.emissionSeen && this.deps.freshness.isFresh(this.def.stream);
+    const connectedAt = this.deps.freshness.sessionConnectAtMs;
+    return this.emissionSeen && connectedAt !== null && this.localFreshAt >= connectedAt;
   }
 
   private tryTakeOwnership(): boolean {
     if (this.owned) return true;
+    if (this.checkpointRefresh.pending) return false;
     const apiFreshAt = this.snap?.record.fetchedAt ?? Number.NEGATIVE_INFINITY;
     if (!(this.localFresh() && this.freshAt() > apiFreshAt)) return false;
     // Ownership: local owns the list; S and its shields retire wholesale (R2, F4-005).
@@ -327,7 +407,8 @@ export class RacedListStore<TItem, TScope, TApi, K extends OrderKey<TItem>> {
     if (this.snap) {
       if (this.def.apiScopeSupersetOfLocal) {
         for (const [id, row] of this.snap.rows) {
-          if (!overlay.has(id) && !this.tombstones.has(id)) overlay.set(id, { row, origin: 'api', presentLocally: false });
+          if (!overlay.has(id) && !this.tombstones.has(id))
+            overlay.set(id, { row, origin: 'api', presentLocally: false });
         }
       }
       this.deps.crud.closeWindow(this.snap.window);
@@ -383,13 +464,18 @@ export class RacedListStore<TItem, TScope, TApi, K extends OrderKey<TItem>> {
 
       // 1. pending (three-set union): local state wins unconditionally (R1/R2)
       if (pending) {
-        if (inLocal !== undefined) entries.push({ row: inLocal, origin: 'local', presentLocally: true });
+        if (inLocal !== undefined)
+          entries.push({ row: inLocal, origin: 'local', presentLocally: true });
         // DELETE absent locally → suppressed; INSERT/UPDATE filtered out locally → not rendered
         continue;
       }
       // 2. in both, not pending → the fresher source wins (R3)
       if (inLocal !== undefined && inS !== undefined) {
-        entries.push(apiFresher ? { row: inS, origin: 'api', presentLocally: true } : { row: inLocal, origin: 'local', presentLocally: true });
+        entries.push(
+          apiFresher
+            ? { row: inS, origin: 'api', presentLocally: true }
+            : { row: inLocal, origin: 'local', presentLocally: true },
+        );
         continue;
       }
       // 3. local-only, not pending
@@ -419,10 +505,18 @@ export class RacedListStore<TItem, TScope, TApi, K extends OrderKey<TItem>> {
   private finalize(entries: OverlayEntry<TItem>[], stale = false): PagedRow<TItem>[] {
     entries.sort((a, b) => this.compare(a.row, b.row));
     const limited = entries.slice(0, this.def.limit); // R7: the list is a window
-    return limited.map((e) => (stale ? { row: e.row, origin: e.origin, presentLocally: e.presentLocally, stale: true } : { row: e.row, origin: e.origin, presentLocally: e.presentLocally }));
+    return limited.map((e) =>
+      stale
+        ? { row: e.row, origin: e.origin, presentLocally: e.presentLocally, stale: true }
+        : { row: e.row, origin: e.origin, presentLocally: e.presentLocally },
+    );
   }
 
-  private build(items: PagedRow<TItem>[], state: ListState, awaiting: { local: boolean; api: boolean }): RacedListResult<TItem> {
+  private build(
+    items: PagedRow<TItem>[],
+    state: ListState,
+    awaiting: { local: boolean; api: boolean },
+  ): RacedListResult<TItem> {
     const errors: ListErrors = {};
     if (this.localError) errors.local = this.localError;
     if (this.snapError) errors.api = this.snapError;
@@ -439,10 +533,18 @@ export class RacedListStore<TItem, TScope, TApi, K extends OrderKey<TItem>> {
     const freshAt = this.deps.freshness.freshAtFor(this.def.stream);
     const m: RaceMeasurement = {
       list: this.def.id,
-      winner: this.localMs !== null && (this.apiMs === null || this.localMs <= this.apiMs) ? 'local' : this.apiMs !== null ? 'api' : 'none',
+      winner:
+        this.localMs !== null && (this.apiMs === null || this.localMs <= this.apiMs)
+          ? 'local'
+          : this.apiMs !== null
+            ? 'api'
+            : 'none',
       localMs: this.localMs,
       apiMs: this.apiMs,
-      sessionFreshnessMs: connectAt !== null && Number.isFinite(freshAt) && freshAt >= connectAt ? this.deps.clock.now() - connectAt : null,
+      sessionFreshnessMs:
+        connectAt !== null && Number.isFinite(freshAt) && freshAt >= connectAt
+          ? this.deps.clock.now() - connectAt
+          : null,
       rowsRendered: result.items.length,
       source: result.state,
     };

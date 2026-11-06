@@ -1,4 +1,12 @@
-import { createContext, createElement, useContext, useEffect, useMemo, useSyncExternalStore, type ReactNode } from 'react';
+import {
+  createContext,
+  createElement,
+  useContext,
+  useEffect,
+  useMemo,
+  useSyncExternalStore,
+  type ReactNode,
+} from 'react';
 import { infiniteQueryKey } from 'powersync-bridge';
 import type {
   Bridge,
@@ -21,6 +29,13 @@ import type {
 // It renders from the engine store via useSyncExternalStore only.
 
 const BridgeContext = createContext<Bridge | null>(null);
+const BridgeActivityContext = createContext(true);
+
+/** Pause read observers in a hidden subtree while retaining their scoped snapshots. */
+export const BridgeActivity = ({ active, children }: { active: boolean; children?: ReactNode }) => {
+  const parentActive = useContext(BridgeActivityContext);
+  return createElement(BridgeActivityContext.Provider, { value: parentActive && active }, children);
+};
 
 export interface BridgeProviderProps {
   bridge: Bridge;
@@ -31,7 +46,9 @@ export interface BridgeProviderProps {
 
 /** Mount once at app root. Crud-delta observation started at createBridge(), not here (F6-001). */
 export function BridgeProvider({ bridge, children, online }: BridgeProviderProps) {
-  useEffect(() => { bridge.setOnline(online); }, [bridge, online]);
+  useEffect(() => {
+    bridge.setOnline(online);
+  }, [bridge, online]);
   return createElement(BridgeContext.Provider, { value: bridge }, children);
 }
 
@@ -48,20 +65,32 @@ export const useInfiniteQuery = <T extends { id: string }>(
   options: InfiniteQueryOptions<T>,
 ): UseInfiniteQueryResult<T> => {
   const bridge = useBridge();
+  const active = useContext(BridgeActivityContext);
   const epoch = useEpoch(bridge);
   const key = infiniteQueryKey(options);
   // Definitions are closures; every changing predicate belongs in queryKey.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const controller = useMemo(() => bridge.query(options), [bridge, epoch, key]);
   useEffect(() => {
-    controller.retain();
-    return () => controller.release();
-  }, [controller]);
-  const result = useSyncExternalStore(controller.store.subscribe, controller.store.getSnapshot, controller.store.getSnapshot);
-  return useMemo(() => ({
-    ...result, fetchNextPage: controller.fetchNextPage, retry: controller.retry,
-    refresh: controller.refresh, refetch: controller.refresh, continueOlder: controller.continueOlder,
-  }), [result, controller]);
+    controller.retain(active);
+    return () => controller.release(active);
+  }, [controller, active]);
+  const result = useSyncExternalStore(
+    controller.store.subscribe,
+    controller.store.getSnapshot,
+    controller.store.getSnapshot,
+  );
+  return useMemo(
+    () => ({
+      ...result,
+      fetchNextPage: controller.fetchNextPage,
+      retry: controller.retry,
+      refresh: controller.refresh,
+      refetch: controller.refresh,
+      continueOlder: controller.continueOlder,
+    }),
+    [result, controller],
+  );
 };
 
 export function useBridge(): Bridge {
@@ -71,13 +100,17 @@ export function useBridge(): Bridge {
 }
 
 function useEpoch(bridge: Bridge): number {
-  return useSyncExternalStore(bridge.epochStore.subscribe, bridge.epochStore.getSnapshot, bridge.epochStore.getSnapshot);
+  return useSyncExternalStore(
+    bridge.epochStore.subscribe,
+    bridge.epochStore.getSnapshot,
+    bridge.epochStore.getSnapshot,
+  );
 }
 
 interface Retainable<S> {
   readonly store: Store<S>;
-  retain(): void;
-  release(): void;
+  retain(active?: boolean): void;
+  release(active?: boolean): void;
 }
 
 /**
@@ -85,15 +118,24 @@ interface Retainable<S> {
  * an effect so StrictMode's double-invoke is a no-op pair (R10); the store is shared across
  * components that ask for the same definition + scope.
  */
-function useRetained<S>(bridge: Bridge, key: string, acquire: () => Retainable<S>): S {
+function useRetained<S>(
+  bridge: Bridge,
+  key: string,
+  acquire: () => Retainable<S>,
+  active = true,
+): S {
   const epoch = useEpoch(bridge);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const holder = useMemo(() => acquire(), [bridge, epoch, key]);
   useEffect(() => {
-    holder.retain();
-    return () => holder.release();
-  }, [holder]);
-  return useSyncExternalStore(holder.store.subscribe, holder.store.getSnapshot, holder.store.getSnapshot);
+    holder.retain(active);
+    return () => holder.release(active);
+  }, [holder, active]);
+  return useSyncExternalStore(
+    holder.store.subscribe,
+    holder.store.getSnapshot,
+    holder.store.getSnapshot,
+  );
 }
 
 export function useRacedList<TItem, TScope, TApi, K extends OrderKey<TItem>>(
@@ -101,8 +143,9 @@ export function useRacedList<TItem, TScope, TApi, K extends OrderKey<TItem>>(
   scope: TScope,
 ): RacedListResult<TItem> {
   const bridge = useBridge();
+  const active = useContext(BridgeActivityContext);
   const key = `${def.id}:${JSON.stringify(scope ?? null)}`;
-  return useRetained(bridge, key, () => bridge.raced(def, scope));
+  return useRetained(bridge, key, () => bridge.raced(def, scope), active);
 }
 
 export interface UseInfiniteListResult<TItem> extends InfiniteListResult<TItem> {
@@ -124,7 +167,11 @@ export function useInfiniteList<TItem, TScope, K extends OrderKey<TItem>, TCurso
     store.retain();
     return () => store.release();
   }, [store]);
-  const result = useSyncExternalStore(store.store.subscribe, store.store.getSnapshot, store.store.getSnapshot);
+  const result = useSyncExternalStore(
+    store.store.subscribe,
+    store.store.getSnapshot,
+    store.store.getSnapshot,
+  );
   return useMemo(
     () => ({ ...result, loadMore: () => void store.loadMore(), retry: () => void store.retry() }),
     [result, store],
@@ -132,7 +179,11 @@ export function useInfiniteList<TItem, TScope, K extends OrderKey<TItem>, TCurso
 }
 
 /** The default "pull one row into the offline DB" primitive (§7). */
-export function useOnDemandStream(name: string, params: Params | null, opts: OnDemandOptions = {}): OnDemandResult {
+export function useOnDemandStream(
+  name: string,
+  params: Params | null,
+  opts: OnDemandOptions = {},
+): OnDemandResult {
   const bridge = useBridge();
   const key = `${name}:${JSON.stringify(params)}:${JSON.stringify(opts)}`;
   return useRetained(bridge, key, () => bridge.onDemand(name, params, opts));

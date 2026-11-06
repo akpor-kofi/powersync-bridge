@@ -1,6 +1,6 @@
 {
   "name": "@powersync-bridge/drizzle",
-  "version": "0.0.1-alpha.1",
+  "version": "0.0.1-alpha.2",
   "description": "Drizzle adapter for powersync-bridge: executes builders through the ORM so rows arrive decoded, derives watched tables, and hands the SDK a compilable query.",
   "license": "MIT",
   "type": "module",

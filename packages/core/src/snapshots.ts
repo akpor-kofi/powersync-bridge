@@ -2,6 +2,7 @@ import type { BridgeClock } from './clock';
 
 /** Minimal TanStack QueryClient surface the bridge relies on (R11: fetchQuery + keying only). */
 export interface MinimalQueryClient {
+  cancelQueries?(filters: { queryKey: readonly unknown[]; exact: boolean }): Promise<unknown>;
   fetchQuery<T>(opts: {
     queryKey: readonly unknown[];
     queryFn: (ctx: { signal: AbortSignal }) => Promise<T>;
@@ -53,7 +54,10 @@ export class SnapshotCache {
     }
     if (this.entries.size >= 64) {
       for (const [entryKey, entry] of this.entries) {
-        if (entry.result) { this.entries.delete(entryKey); break; }
+        if (entry.result) {
+          this.entries.delete(entryKey);
+          break;
+        }
       }
     }
     const controller = new AbortController();
@@ -62,7 +66,11 @@ export class SnapshotCache {
       return { rows: res.rows, asOf: res.asOf, requestedAt: now, fetchedAt: this.clock.now() };
     };
     const promise = this.queryClient
-      ? this.queryClient.fetchQuery<SnapshotRecord<TApi>>({ queryKey: key, queryFn: ({ signal }) => run(signal), staleTime })
+      ? this.queryClient.fetchQuery<SnapshotRecord<TApi>>({
+          queryKey: key,
+          queryFn: ({ signal }) => run(signal),
+          staleTime,
+        })
       : run(controller.signal);
     const entry: Entry<TApi> = { requestedAt: now, promise, result: null, controller };
     this.entries.set(k, entry as Entry<unknown>);
@@ -81,6 +89,9 @@ export class SnapshotCache {
   invalidate(key: readonly unknown[]): void {
     const encoded = JSON.stringify(key);
     this.entries.get(encoded)?.controller.abort(new Error('invalidated'));
+    // TanStack owns its in-flight promise; removing only our entry would let a
+    // resumed observer reuse the aborted request before that promise settles.
+    void this.queryClient?.cancelQueries?.({ queryKey: key, exact: true }).catch(() => {});
     this.entries.delete(encoded);
   }
 

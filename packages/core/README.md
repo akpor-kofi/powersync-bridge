@@ -83,6 +83,34 @@ require a connection. Reconnection resumes the pending API range without clearin
 The lower-level `useRacedList`, `useInfiniteList`, `useOnDemandStream` and `useAutoSync` APIs
 remain available for specialized workflows. Ordinary paginated lists need only `useInfiniteQuery`.
 
+## Hidden screens and checkpoint bursts
+
+Wrap a retained screen or tab in `BridgeActivity` and pass its existing visibility state:
+
+```tsx
+import { BridgeActivity } from '@powersync-bridge/react';
+
+<BridgeActivity active={isVisible}>
+  <ServicesScreen />
+</BridgeActivity>
+```
+
+This applies to `useInfiniteQuery` and `useRacedList`. Pausing stops their SQLite watches,
+checkpoint reads and pending API requests while keeping the last result and loaded page window.
+Returning refreshes the local baseline, including rows changed or deleted while hidden.
+An active consumer elsewhere keeps a shared query running. Nested boundaries cannot reactivate
+an inactive parent. Identity, permissions and query-key changes still clear the outgoing scope.
+Use `enabled` for query eligibility and `BridgeActivity` for temporary screen visibility.
+On-demand sync streams and uploads continue independently.
+
+Checkpoint refreshes are single-flight per observer. A synchronous burst produces one read;
+changes during that read produce one follow-up, and superseded results cannot claim freshness.
+Checkpoint maintenance shares one background-read slot across the bridge; first reads and
+pagination bypass that queue. Queued maintenance is cancelled when its observer pauses.
+Unscoped queries refresh only for global checkpoints. A query declaring `stream` also refreshes
+for its own stream, rather than every unrelated stream. Closing a watch cancels its queued
+follow-up. Applications need no checkpoint debounce, refresh queue or cache workaround.
+
 ## What your backend must change
 
 **Nothing.** No new tables, no new columns, no change to existing sync streams. The one rule is an

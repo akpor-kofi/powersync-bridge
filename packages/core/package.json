@@ -1,6 +1,6 @@
 {
   "name": "powersync-bridge",
-  "version": "0.0.1-alpha.1",
+  "version": "0.0.1-alpha.2",
   "description": "Client-side bridge between a PowerSync local SQLite database and a conventional HTTP API: raced first paint, pending-write-aware reconcile, bounded partition escalation.",
   "license": "MIT",
   "type": "module",

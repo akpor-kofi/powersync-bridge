@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.0.1-alpha.2
+
+- Coalesce checkpoint bursts into one read per observer, with one serialized follow-up when another checkpoint arrives during a read.
+- Serialize checkpoint maintenance across distinct observers without queueing first reads or pagination behind it.
+- Ignore unrelated stream checkpoints and prevent superseded refreshes from claiming local ownership.
+- Add `BridgeActivity` for `useInfiniteQuery` and `useRacedList`: pause hidden reads without discarding rows or page windows; resume with a fresh local baseline.
+- Keep shared queries active until their last active observer pauses, including nested activity boundaries and StrictMode.
+- Cancel pending API requests and queued watch work; fence late responses, old page reads, and previous identities.
+- Detect rows deleted while hidden, preserve offline pagination, and recover local watching after API cancellation.
+- Fix watch recovery when a query adapter throws synchronously, and remove unused unbounded checkpoint history.
+
+### Operational notes
+
+Upgrade all four packages together to `0.0.1-alpha.2`. Hidden retained screens can adopt `BridgeActivity` using their existing visibility signal. Existing callers remain active by default. No consumer patch, runtime dependency, database migration, sync-stream change, environment variable or native setting is required.
+
 ## 0.0.1-alpha.1
 
 - Add `useInfiniteQuery` for a complete raced, paginated list from one query definition.

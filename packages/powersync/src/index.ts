@@ -37,7 +37,8 @@ function mapOp(op: CrudEntry['op']): PendingOp {
 
 function idOf(row: unknown): string {
   const id = (row as { id?: unknown }).id;
-  if (id === undefined || id === null) throw new Error('@powersync-bridge/powersync: rows must have an `id`');
+  if (id === undefined || id === null)
+    throw new Error('@powersync-bridge/powersync: rows must have an `id`');
   return String(id);
 }
 
@@ -96,53 +97,52 @@ export class PowerSyncDriver implements BridgeDriver {
         let prev = new Map<string, string>();
         let first = true;
         let closed = false;
-        let running: Promise<void> | null = null;
+        const abort = new AbortController();
+        let running = false;
         let pending = false;
 
         const run = async (): Promise<void> => {
           if (closed) return;
           if (running) {
-            pending = true; // coalesce
+            pending = true;
             return;
           }
-          running = (async () => {
-            try {
-              const rows = await q.run();
-              if (closed) return;
-              const next = new Map<string, string>();
-              const byId = new Map<string, T>();
-              for (const r of rows) {
-                const id = idOf(r);
-                next.set(id, JSON.stringify(r));
-                byId.set(id, r);
-              }
-              const added: T[] = [];
-              const updated: T[] = [];
-              const removed: string[] = [];
-              for (const [id, json] of next) {
-                const p = prev.get(id);
-                if (p === undefined) added.push(byId.get(id) as T);
-                else if (p !== json) updated.push(byId.get(id) as T);
-              }
-              for (const id of prev.keys()) if (!next.has(id)) removed.push(id);
-              const changed = first || added.length > 0 || updated.length > 0 || removed.length > 0;
-              prev = next;
-              first = false;
-              if (changed) {
-                const diff: RowDiff<T> = { all: rows, added, updated, removed };
-                onDiff(diff);
-              }
-            } catch (e) {
-              onError?.(e instanceof Error ? e : new Error(String(e)));
-            } finally {
-              running = null;
-              if (pending) {
-                pending = false;
-                void run();
-              }
+          running = true;
+          try {
+            const rows = await q.run(abort.signal);
+            if (closed) return;
+            const next = new Map<string, string>();
+            const byId = new Map<string, T>();
+            for (const r of rows) {
+              const id = idOf(r);
+              next.set(id, JSON.stringify(r));
+              byId.set(id, r);
             }
-          })();
-          return running;
+            const added: T[] = [];
+            const updated: T[] = [];
+            const removed: string[] = [];
+            for (const [id, json] of next) {
+              const p = prev.get(id);
+              if (p === undefined) added.push(byId.get(id) as T);
+              else if (p !== json) updated.push(byId.get(id) as T);
+            }
+            for (const id of prev.keys()) if (!next.has(id)) removed.push(id);
+            const changed = first || added.length > 0 || updated.length > 0 || removed.length > 0;
+            prev = next;
+            first = false;
+            if (changed) {
+              const diff: RowDiff<T> = { all: rows, added, updated, removed };
+              onDiff(diff);
+            }
+          } catch (e) {
+            if (!closed) onError?.(e instanceof Error ? e : new Error(String(e)));
+          } finally {
+            running = false;
+            if (pending) {
+              pending = false;
+              void run();
+            }
+          }
         };
 
         const stop = this.db.onChange(
@@ -152,6 +152,8 @@ export class PowerSyncDriver implements BridgeDriver {
         void run();
         return () => {
           closed = true;
+          pending = false;
+          abort.abort();
           stop();
         };
       },
@@ -187,7 +189,10 @@ export class PowerSyncDriver implements BridgeDriver {
   private startCrudWatch(): void {
     // A local write always changes a user table; an upload completion changes sync status.
     // Both trigger a re-read of the queue; the delta is derived by diffing snapshots.
-    const stopChange = this.db.onChange({ onChange: () => void this.resyncCrud() }, { throttleMs: 50 });
+    const stopChange = this.db.onChange(
+      { onChange: () => void this.resyncCrud() },
+      { throttleMs: 50 },
+    );
     const stopStatus = this.db.registerListener({ statusChanged: () => void this.resyncCrud() });
     this.crudWatchStop = () => {
       stopChange();
@@ -231,7 +236,10 @@ export class PowerSyncDriver implements BridgeDriver {
     if (ids.length === 0) return new Set();
     const quoted = `"${table.replace(/"/g, '""')}"`;
     const placeholders = ids.map(() => '?').join(', ');
-    const rows = await this.db.getAll<{ id: string }>(`SELECT id FROM ${quoted} WHERE id IN (${placeholders})`, [...ids]);
+    const rows = await this.db.getAll<{ id: string }>(
+      `SELECT id FROM ${quoted} WHERE id IN (${placeholders})`,
+      [...ids],
+    );
     return new Set(rows.map((r) => String(r.id)));
   }
 
@@ -243,7 +251,11 @@ export class PowerSyncDriver implements BridgeDriver {
 
   // -- streams -----------------------------------------------------------------
 
-  async syncStream(name: string, params: Params | null, opts: { ttl?: number; priority?: 0 | 1 | 2 | 3 } = {}): Promise<StreamHandle> {
+  async syncStream(
+    name: string,
+    params: Params | null,
+    opts: { ttl?: number; priority?: 0 | 1 | 2 | 3 } = {},
+  ): Promise<StreamHandle> {
     const stream = this.db.syncStream(name, params ?? undefined);
     const subOpts: { ttl?: number; priority?: 0 | 1 | 2 | 3 } = {};
     if (opts.ttl !== undefined) subOpts.ttl = opts.ttl;
